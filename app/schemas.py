@@ -99,6 +99,58 @@ class DecideIn(BaseModel):
     cost: float = Field(..., gt=0, description="本次请求需要的令牌数，所有命中桶统一扣减")
 
 
+class DecideBatchItemIn(BaseModel):
+    request_id: str = Field(..., min_length=1, description="单笔裁决幂等键，与 /decide 语义一致")
+    tenant_id: Optional[str] = None
+    route_id: Optional[str] = Field(default=None, description="提供 route_id 时必须带 tenant_id")
+    cost: float = Field(..., gt=0, description="本笔需要的令牌数，所有命中桶统一扣减")
+
+
+class DecideBatchIn(BaseModel):
+    batch_id: str = Field(..., min_length=1, description="批次幂等键，完整载荷一致才允许重放")
+    requests: list[DecideBatchItemIn] = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        description="1～50 笔裁决请求，按数组顺序演算共享的多级桶",
+    )
+
+    @field_validator("requests")
+    @classmethod
+    def _route_requires_tenant(cls, items: list[DecideBatchItemIn]) -> list[DecideBatchItemIn]:
+        for i, item in enumerate(items):
+            if item.route_id and not item.tenant_id:
+                raise ValueError(f"requests[{i}] 提供 route_id 时必须同时提供 tenant_id")
+        return items
+
+
+class DecideBatchOut(BaseModel):
+    batch_id: str
+    committed: bool = Field(..., description="true=整批获准并已落账；false=任一项失败，业务数据未改动")
+    size: int
+    failed_index: Optional[int] = Field(
+        default=None,
+        description="导致整批放弃的项下标（从 0 开始）；成功批次为 null",
+    )
+    reason: Optional[Literal["insufficient", "duplicate_request_id"]] = Field(
+        default=None,
+        description="失败原因：余额不足 / request_id 已存在（含批次内重复）",
+    )
+    failed_request_id: Optional[str] = Field(
+        default=None, description="失败项的 request_id；成功批次为 null"
+    )
+    buckets: Optional[list[BucketOut]] = Field(
+        default=None,
+        description="失败项在演算时刻命中的多级桶状态（含前项扣减后的余额）；成功批次为 null",
+    )
+    decisions: Optional[list[DecisionOut]] = Field(
+        default=None,
+        description="成功批次按数组顺序产生的单笔裁决；失败批次为 null",
+    )
+    created_at: str
+    replayed: bool = Field(default=False, description="true=该 batch_id 的完整载荷重放")
+
+
 class BucketOut(BaseModel):
     scope: str
     tenant_id: Optional[str]

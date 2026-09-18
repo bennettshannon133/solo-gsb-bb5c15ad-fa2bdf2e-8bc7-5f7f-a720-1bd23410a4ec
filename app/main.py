@@ -7,7 +7,7 @@
 管理写接口（PUT /policies、POST /policies/rollback、POST /policy-changes、
 DELETE /policy-changes/{change_id}）需要 HMAC-SHA256 防重放签名
 （X-Key-Id/X-Timestamp/X-Nonce/X-Signature，见 app/auth.py）；
-所有 GET、POST /decide 裁决与撤销接口保持匿名可用。
+所有 GET、POST /decide、POST /decide-batches 裁决与撤销接口保持匿名可用。
 """
 
 from __future__ import annotations
@@ -23,6 +23,8 @@ from .auth import AdminPrincipal, require_admin, reserve_nonce
 from .database import connect, init_db, write_tx
 from .schemas import (
     BucketOut,
+    DecideBatchIn,
+    DecideBatchOut,
     DecideIn,
     DecisionOut,
     LowBalanceEventOut,
@@ -51,11 +53,14 @@ app = FastAPI(
         "策略可配置 low_balance_threshold，余额越线时产生 low_balance 事件；"
         "支持提交未来生效的策略定时切换，由裁决在同一事务内惰性应用；"
         "策略变更追加不可变版本记录，支持历史查询与同事务回滚。"
+        "POST /decide-batches 在一个写事务、同一时刻内应用到期切换后"
+        "按数组顺序演算共享的多级桶，全部获准才落账，否则业务数据不变；"
+        "batch_id 对完整载荷幂等。"
         "管理写接口（策略新增/更新、回滚、定时变更创建/取消）需要"
         " HMAC-SHA256 防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature）；"
-        "GET、裁决与撤销接口无需认证。"
+        "GET、单笔/批量裁决与撤销接口无需认证。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -301,6 +306,32 @@ def decide(body: DecideIn, conn: sqlite3.Connection = Depends(get_conn)) -> dict
             cost=body.cost,
         )
         return result
+
+
+@app.post(
+    "/decide-batches",
+    response_model=DecideBatchOut,
+    tags=["裁决"],
+    responses={
+        409: {"description": "batch_id 已存在但批次载荷不一致"},
+        404: {"description": "批次中某笔没有命中任何已配置的配额策略"},
+    },
+)
+def decide_batches(body: DecideBatchIn, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    """在一个 BEGIN IMMEDIATE 事务内顺序演算一批共享多级桶的裁决。
+
+    同一时刻先应用所有命中且到期的定时策略切换，再按数组顺序逐笔演算，
+    前项扣减后的余额供后项使用。仅全部获准时才写入桶余额、普通裁决与
+    低余额事件；任一项不足或 request_id 已存在则业务数据不变，
+    返回 committed=false、failed_index 与该项桶状态。无论成败均保存
+    批次结果；batch_id 对完整载荷幂等，同键异载荷 409。无需认证。
+    """
+    with write_tx(conn):
+        return quota.decide_batch(
+            conn,
+            batch_id=body.batch_id,
+            items=[item.model_dump() for item in body.requests],
+        )
 
 
 @app.post(

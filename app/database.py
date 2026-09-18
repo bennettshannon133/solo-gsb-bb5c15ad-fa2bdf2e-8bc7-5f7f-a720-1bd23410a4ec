@@ -54,6 +54,23 @@ CREATE TABLE IF NOT EXISTS decisions (
     revoked_at        TEXT
 ) STRICT;
 
+-- 批量裁决：POST /decide-batches 以 batch_id 为幂等键保存批次结果。
+-- 无论整批提交（committed=1）还是在某项失败/request_id 冲突时整体放弃
+-- （committed=0），批次结果都落库；同 batch_id 必须同载荷（payload_hash），
+-- 载荷冲突由应用层在写事务内检出并返回 409。
+-- 成功批次中每笔单笔裁决照常写入 decisions 表，可由 /decide 重放与撤销。
+CREATE TABLE IF NOT EXISTS decide_batches (
+    batch_id        TEXT PRIMARY KEY,
+    payload_hash    TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    committed       INTEGER NOT NULL CHECK (committed IN (0, 1)),
+    size            INTEGER NOT NULL CHECK (size BETWEEN 1 AND 50),
+    failed_index    INTEGER CHECK (failed_index IS NULL OR failed_index >= 0),
+    reason          TEXT CHECK (reason IS NULL OR reason IN ('insufficient', 'duplicate_request_id')),
+    result_json     TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+) STRICT;
+
 -- 低余额事件：获准裁决令某桶从阈值之上降至不高于阈值时，
 -- 与扣减在同一事务内写入；id 自增，作为 /events 分页的稳定游标
 CREATE TABLE IF NOT EXISTS low_balance_events (
