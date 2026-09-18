@@ -19,6 +19,22 @@
 - **幂等重放**：相同 `request_id` 且裁决载荷（tenant_id / route_id / cost）一致时，
   直接返回原裁决结果（`replayed=true`），不重复扣减；载荷冲突返回 **409**。
   通过与拒绝的裁决都会存档。
+- **批量裁决（POST /decide-batches）**：一次提交一个 `batch_id` 与 **1～50** 个
+  含 `request_id`、`tenant_id`、`route_id`、`cost` 的请求，整个批次在**一个
+  `BEGIN IMMEDIATE` 事务**内完成：
+  - 先以**同一时刻**应用所有条目命中且到期的策略定时切换（一次），再**按数组
+    顺序**演算共享的多级桶——**前项扣减后的余额供后项使用**；
+  - **仅当全部条目获准**时，才写入桶余额、普通裁决（`decisions`）与低余额
+    事件；任一项余额不足（`insufficient_balance`）或 `request_id` 已存在
+    （含批内重复，`request_id_exists`）时，这些业务数据**一律不变**（业务事务
+    整体回滚），返回 `committed=false`、首个失败项下标 `failed_index` 和该项
+    **当时**命中桶的状态（已含前项的模拟扣减，但未持久化）；
+  - **无论成败批次结果都保存**，按 `batch_id` 对**完整载荷**幂等：同键同载荷
+    重放原结果（成功/失败均重放，`replayed=true`）；同键异载荷返回 **409**；
+  - 成功批次中的每笔裁决都以其自身的 `request_id` 写入普通裁决存档，仍可由
+    `POST /decide`（同载荷重放）查询、由 `POST /decide/{request_id}/revoke`
+    撤销；低余额事件的 `request_id` 归属触发它的那个条目；
+  - 与单笔裁决相同，批中某条目没有命中任何已配置策略层级时整批返回 **404**。
 - **撤销**：可撤销已通过的裁决并向当时命中的桶补回令牌，重复撤销保持幂等；
   补回时同样先补充再退还，最终余额**不超过桶容量**。
 - **低余额事件**：策略可配置 `low_balance_threshold`（`null` 关闭，否则须在
@@ -55,7 +71,8 @@
 - **管理写接口 HMAC-SHA256 防重放认证**：仅保护四个管理写接口——
   `PUT /policies`（策略新增/更新）、`POST /policies/rollback`（回滚）、
   `POST /policy-changes`（定时变更创建）、`DELETE /policy-changes/{change_id}`
-  （定时变更取消）。**所有 GET、`POST /decide` 裁决与撤销接口保持原样、无需认证**。
+  （定时变更取消）。**所有 GET、`POST /decide`、`POST /decide-batches` 裁决与
+撤销接口保持原样、无需认证**。
   客户端发送 `X-Key-Id`、`X-Timestamp`（Unix 秒）、`X-Nonce`、`X-Signature` 四个头，
   签名原文为 `方法\n原始路径及查询串\n请求体 SHA-256 十六进制\n时间戳\nnonce`，
   签名值为小写十六进制 HMAC-SHA256。服务端用 `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET`
@@ -254,7 +271,8 @@ print(urllib.request.urlopen(req).read().decode())
 | `DELETE` 🔐 | `/policy-changes/{change_id}` | 在生效前取消待生效变更（重复取消幂等） |
 | `GET`  | `/buckets` | 查看所有已创建桶补充后的实时余额（只读，不落库） |
 | `POST` | `/decide` | 提交一次多级裁决（事务内先应用命中且到期的变更） |
-| `POST` | `/decide/{request_id}/revoke` | 撤销一次已通过的裁决（重复撤销幂等） |
+| `POST` | `/decide-batches` | 一个事务内整批裁决 1～50 个请求（同刻应用到期切换、按序演算共享桶、全获准才落库、batch_id 幂等） |
+| `POST` | `/decide/{request_id}/revoke` | 撤销一次已通过的裁决（含成功批次中的单笔；重复撤销幂等） |
 | `GET`  | `/events` | 按 id 递增分页查询 low_balance 事件（`after_id` / `limit`） |
 
 策略对象：
@@ -357,6 +375,84 @@ print(urllib.request.urlopen(req).read().decode())
 
 > `tenant_id`、`route_id` 均可省略；省略即不命中对应层级。
 > `cost` 对所有命中桶统一扣减同一数量。
+
+批量裁决请求（`POST /decide-batches`，免认证；`requests` 长度 1～50）：
+
+```json
+{
+  "batch_id": "batch-20260918-001",
+  "requests": [
+    {"request_id": "req-001", "tenant_id": "acme", "route_id": "/v1/search", "cost": 3},
+    {"request_id": "req-002", "tenant_id": "acme", "route_id": "/v1/search", "cost": 2},
+    {"request_id": "req-003", "tenant_id": "acme", "cost": 1}
+  ]
+}
+```
+
+> - 所有条目在**同一事务、同一时刻**先应用命中且到期的策略切换，再**按数组
+>   顺序**演算共享桶：前项扣减后的余额供后项使用；
+> - 全部获准才统一落库。`batch_id` 对**完整载荷**（各条目的 request_id /
+>   tenant_id / route_id / cost 与数组顺序）幂等：同键同载荷重放原结果，
+>   同键异载荷返回 **409**；
+> - 成功批次中的单笔裁决以各自 `request_id` 存档，可用 `POST /decide` 重放、
+>   `POST /decide/{request_id}/revoke` 撤销。
+
+成功响应（`committed=true`，`results` 按下标顺序给出各单笔裁决，结构同
+`POST /decide`）：
+
+```json
+{
+  "batch_id": "batch-20260918-001",
+  "committed": true,
+  "replayed": false,
+  "decided_at": "2026-09-18T10:00:00.000000Z",
+  "results": [
+    {"index": 0, "request_id": "req-001", "allowed": true, "cost": 3.0,
+     "tenant_id": "acme", "route_id": "/v1/search",
+     "decided_at": "2026-09-18T10:00:00.000000Z",
+     "buckets": [ {"scope": "global", "balance": 7.0},
+                  {"scope": "tenant", "tenant_id": "acme", "balance": 3.0},
+                  {"scope": "route",  "tenant_id": "acme", "route_id": "/v1/search", "balance": 1.0} ]},
+    {"index": 1, "request_id": "req-002", "allowed": true, "cost": 2.0,
+     "tenant_id": "acme", "route_id": "/v1/search",
+     "decided_at": "2026-09-18T10:00:00.000000Z",
+     "buckets": [ {"scope": "global", "balance": 5.0},
+                  {"scope": "tenant", "tenant_id": "acme", "balance": 1.0} ]}
+  ],
+  "failed_index": null,
+  "failure": null
+}
+```
+
+失败响应（HTTP 仍为 200，`committed=false`：桶余额、普通裁决与低余额事件均未
+改变；`failure.buckets` 是失败那一刻该项命中桶的状态，已反映前项的模拟扣减）：
+
+```json
+{
+  "batch_id": "batch-20260918-002",
+  "committed": false,
+  "replayed": false,
+  "decided_at": "2026-09-18T10:01:00.000000Z",
+  "results": null,
+  "failed_index": 1,
+  "failure": {
+    "index": 1,
+    "request_id": "req-002",
+    "reason": "insufficient_balance",
+    "cost": 2.0,
+    "tenant_id": "acme",
+    "route_id": "/v1/search",
+    "buckets": [ {"scope": "global", "balance": 7.0},
+                 {"scope": "tenant", "tenant_id": "acme", "balance": 0.0} ]
+  }
+}
+```
+
+> `reason` 取值：`insufficient_balance`（该项某命中桶余额不足）或
+> `request_id_exists`（该 `request_id` 已被单笔裁决/先前成功批次存档，或在本
+> 批次内重复）。失败批次同样按 `batch_id` 存档，重放返回同一失败结果且
+> `replayed=true`。空数组、超过 50 项、空 `batch_id`/`request_id`、`cost<=0`、
+> 只给 `route_id` 不给 `tenant_id` 均返回 **422**。
 
 ## 示例请求
 
@@ -473,6 +569,42 @@ curl -s -X POST http://localhost:8000/decide/req-1/revoke
 ```
 
 对被拒绝的裁决撤销返回 409；对不存在的 `request_id` 撤销返回 404。
+
+### 5b. 批量裁决（整批原子、按序共享桶、批次幂等）
+
+```bash
+# 全局桶容量 10；两项 4+6 恰好打空：前项余额（6）供后项使用
+curl -s -X POST http://localhost:8000/decide-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"b-1","requests":[
+    {"request_id":"req-b1","cost":4},
+    {"request_id":"req-b2","cost":6}
+  ]}'
+# committed=true；results[0].buckets[0].balance=6，results[1]...=0
+
+# 总量超过余额：第二项不足 -> committed=false，桶余额/裁决/事件全部不变；
+# failure.buckets[0].balance 是前项模拟扣减后的 6
+curl -s -X POST http://localhost:8000/decide-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"b-2","requests":[
+    {"request_id":"req-b3","cost":4},
+    {"request_id":"req-b4","cost":7}
+  ]}'
+
+# batch_id 对完整载荷幂等：重放原结果（committed=false, replayed=true）
+curl -s -X POST http://localhost:8000/decide-batches \
+  -H 'Content-Type: application/json' \
+  -d '{"batch_id":"b-2","requests":[
+    {"request_id":"req-b3","cost":4},
+    {"request_id":"req-b4","cost":7}
+  ]}'
+
+# 成功批次中的单笔裁决照常查询（重放）与撤销
+curl -s -X POST http://localhost:8000/decide \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"req-b1","cost":4}'   # replayed=true，不重复扣减
+curl -s -X POST http://localhost:8000/decide/req-b2/revoke
+```
 
 ### 6. 查看桶余额
 
@@ -693,6 +825,19 @@ admin_curl POST /policies/rollback '{"scope":"global","version":1}'
 - 若一次裁决没有命中任何已配置的层级，返回 `404`（提示先配置策略）。
 - `cost ≤ 0` 返回 `422`；`route_id` 必须与 `tenant_id` 一起提供，否则 `422`；
   `low_balance_threshold` 超出 `[0, capacity]` 返回 `422`。
+- 批量裁决（`POST /decide-batches`）的额外约定：
+  - `requests` 长度必须为 1～50，空批次/超长批次、空 `batch_id`/`request_id`、
+    批内 `cost ≤ 0`、只给 `route_id` 不给 `tenant_id` 均返回 `422`，且不保存
+    批次档案；批中某条目没有命中任何策略层级返回 `404`（同样不存档）；
+  - 到期策略切换、补充与所有条目的演算共用**同一时刻**；桶的时间补充对每个
+    命中桶在批次开始时只计算一次，之后仅在条目间传递扣减；
+  - 失败回滚不改变桶余额、`decisions` 与低余额事件，也不把批内的到期切换
+    标记为 applied（切换保持 pending，下次裁决仍会惰性应用）；仅批次档案
+    （`decide_batches`，含成功与失败）在独立事务中写入；
+  - 同一桶在批次中被多个条目命中时，低余额事件按数组顺序逐个判定，事件的
+    `request_id` 为触发越线的那个条目；
+  - 成功批次的每笔裁决都独立写入 `decisions`，其 `decided_at` 为批次时刻，
+    后续单笔重放/撤销语义与普通裁决完全一致。
 - 裁决只保证「整组原子扣减」与最终一致；重试时间是服务端按补充率给出的建议值，
   期间若有其他裁决/撤销发生，实际结果仍以再次裁决为准。
 
@@ -735,19 +880,26 @@ rollback 版本、桶先按当前策略补充再按目标容量截断、pending 
 nonce 同 key 重用 409 与过期清理后可复用、按 key 隔离、
 业务失败（422/404）回滚不占用 nonce、nonce 冲突先于业务校验、
 查询串与百分号编码纳入签名、凭据未配置 fail-closed 503、
-以及 GET/裁决/撤销保持匿名。
+以及 GET/裁决（含 /decide-batches）/撤销保持匿名；
+批量裁决覆盖：全部获准时按数组顺序演算共享桶（含多级）、同一时刻到期切换
+在批事务内应用、仅全获准才落库桶余额/裁决/低余额事件、不足与 request_id
+已存在（单笔存档/先前批次/批内重复）整批回滚且失败快照含前项模拟扣减、
+失败批次存档并可按 batch_id 重放、成功/失败同键异载荷 409、
+成功批次单笔可经 /decide 重放与 /revoke 撤销、低余额事件按项归属且失败不产事件、
+失败回滚后到期切换保持 pending、422/404 校验与不存档、免认证、
+以及 20 线程并发批次不超发。
 
 ## 项目结构
 
 ```
 app/
   auth.py       # 管理写接口 HMAC-SHA256 防重放：签名校验（常量时间比较）、时间窗与 nonce 登记
-  database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 事务、建表（含 admin_nonces）与老库迁移（含 baseline 版本补登）
-  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、幂等存档、撤销与低余额事件
-  schemas.py    # Pydantic 请求/响应模型
-  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名）
+  database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 事务、建表（含 admin_nonces、decide_batches）与老库迁移（含 baseline 版本补登）
+  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、幂等存档、撤销与低余额事件
+  schemas.py    # Pydantic 请求/响应模型（含批量裁决）
+  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches）
 tests/
-  test_api.py   # 行为、并发与 HMAC 认证测试
+  test_api.py   # 行为、并发与 HMAC 认证测试（含批量裁决）
 Dockerfile
 docker-compose.yml
 ```

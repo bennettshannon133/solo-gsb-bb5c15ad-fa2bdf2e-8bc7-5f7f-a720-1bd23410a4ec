@@ -6,7 +6,7 @@
   POST   /policy-changes
   DELETE /policy-changes/{change_id}
 
-所有 GET、裁决（POST /decide）与撤销（.../revoke）不经过本模块，保持匿名可用。
+所有 GET、裁决（POST /decide、POST /decide-batches）与撤销（.../revoke）不经过本模块，保持匿名可用。
 
 客户端必须携带四个请求头：X-Key-Id、X-Timestamp（Unix 秒）、X-Nonce、
 X-Signature。签名原文为（恰好 4 个 ``\\n`` 分隔的 5 段）：

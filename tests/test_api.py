@@ -1106,6 +1106,315 @@ def test_policy_versions_are_append_only(tmp_path):
     finally:
         conn.close()
 
+# ------------------------------------------------------------ 批量裁决
+
+
+def post_batch(client, batch_id, requests_):
+    return client.post(
+        "/decide-batches", json={"batch_id": batch_id, "requests": requests_}
+    )
+
+
+def test_batch_all_allowed_commits_in_array_order(client):
+    # 全局桶 10、速率 0；两笔 4 + 6 恰好打空，前项余额供后项使用
+    put_policy(client, "global", 10, 0)
+    r = post_batch(client, "b1", [
+        {"request_id": "q1", "cost": 4},
+        {"request_id": "q2", "cost": 6},
+    ])
+    assert r.status_code == 200
+    body = r.json()
+    assert body["committed"] is True
+    assert body["replayed"] is False
+    assert body["failed_index"] is None and body["failure"] is None
+    assert [x["index"] for x in body["results"]] == [0, 1]
+    assert [x["request_id"] for x in body["results"]] == ["q1", "q2"]
+    assert body["results"][0]["buckets"][0]["balance"] == 6.0
+    assert body["results"][1]["buckets"][0]["balance"] == 0.0
+    # 全部条目同一时刻演算
+    assert body["results"][0]["decided_at"] == body["results"][1]["decided_at"]
+    # 桶余额已落库
+    assert client.get("/buckets").json()[0]["balance"] == 0.0
+
+
+def test_batch_multilevel_shared_buckets(client):
+    put_policy(client, "global", 5, 0)
+    put_policy(client, "tenant", 3, 0, tenant="t")
+    body = post_batch(client, "b1", [
+        {"request_id": "q1", "tenant_id": "t", "cost": 2},
+        {"request_id": "q2", "tenant_id": "t", "cost": 1},
+    ]).json()
+    assert body["committed"] is True
+    bal = [
+        {b["scope"]: b["balance"] for b in x["buckets"]}
+        for x in body["results"]
+    ]
+    # global: 5->3->2；tenant: 3->1->0
+    assert bal == [{"global": 3.0, "tenant": 1.0}, {"global": 2.0, "tenant": 0.0}]
+    buckets = {b["scope"]: b["balance"] for b in client.get("/buckets").json()}
+    assert buckets == {"global": 2.0, "tenant": 0.0}
+
+
+def test_batch_insufficient_balance_changes_nothing(client):
+    put_policy(client, "global", 10, 0)
+    # 先落一个桶行（10 -> 9），随后 6 + 5 = 11 > 9：第二项失败，
+    # 前项的模拟扣减不得落库
+    client.post("/decide", json={"request_id": "seed", "cost": 1})
+    r = post_batch(client, "b1", [
+        {"request_id": "q1", "cost": 6},
+        {"request_id": "q2", "cost": 5},
+    ])
+    body = r.json()
+    assert body["committed"] is False
+    assert body["failed_index"] == 1
+    assert body["results"] is None
+    failure = body["failure"]
+    assert failure["index"] == 1
+    assert failure["reason"] == "insufficient_balance"
+    assert failure["request_id"] == "q2"
+    # 失败快照：前项模拟扣减后的余额 3 供后项使用
+    assert failure["buckets"][0]["balance"] == 3.0
+    # 业务数据不变：桶仍为 9，无任何 events
+    assert client.get("/buckets").json()[0]["balance"] == 9.0
+    assert client.get("/events").json() == []
+    # 失败批次的 request_id 没有占用：随后可以正常单笔裁决
+    ok = client.post("/decide", json={"request_id": "q1", "cost": 6}).json()
+    assert ok["allowed"] is True
+
+
+def test_batch_failed_result_is_persisted_and_replayable(client):
+    put_policy(client, "global", 1, 0)
+    payload = [{"request_id": "q1", "cost": 2}]
+    first = post_batch(client, "b1", payload).json()
+    assert first["committed"] is False and first["replayed"] is False
+    # 同键同载荷重放：返回存档的失败结果，replayed=true
+    second = post_batch(client, "b1", payload).json()
+    assert second["committed"] is False
+    assert second["replayed"] is True
+    assert second["failed_index"] == 0
+    assert second["failure"]["reason"] == "insufficient_balance"
+
+
+def test_batch_same_id_divergent_payload_returns_409(client):
+    put_policy(client, "global", 100, 0)
+    assert post_batch(client, "b1", [{"request_id": "q1", "cost": 1}]).status_code == 200
+    # 改 cost / request_id / 条目数均视为异载荷
+    for divergent in (
+        [{"request_id": "q1", "cost": 2}],
+        [{"request_id": "q2", "cost": 1}],
+        [{"request_id": "q1", "cost": 1}, {"request_id": "q2", "cost": 1}],
+    ):
+        assert post_batch(client, "b1", divergent).status_code == 409
+    # 同键同载荷仍可重放
+    replay = post_batch(client, "b1", [{"request_id": "q1", "cost": 1}]).json()
+    assert replay["committed"] is True and replay["replayed"] is True
+
+
+def test_batch_failed_then_same_id_divergent_returns_409(client):
+    put_policy(client, "global", 1, 0)
+    post_batch(client, "b1", [{"request_id": "q1", "cost": 2}])
+    assert post_batch(client, "b1", [{"request_id": "q1", "cost": 1}]).status_code == 409
+
+
+def test_batch_request_id_already_in_decisions(client):
+    # 已被单笔裁决占用的 request_id 让整批失败，且不消耗前项
+    put_policy(client, "global", 10, 0)
+    client.post("/decide", json={"request_id": "old", "cost": 1})
+    body = post_batch(client, "b1", [
+        {"request_id": "q1", "cost": 1},
+        {"request_id": "old", "cost": 1},
+    ]).json()
+    assert body["committed"] is False
+    assert body["failed_index"] == 1
+    assert body["failure"]["reason"] == "request_id_exists"
+    assert client.get("/buckets").json()[0]["balance"] == 9.0
+
+
+def test_batch_request_id_from_prior_committed_batch(client):
+    put_policy(client, "global", 10, 0)
+    post_batch(client, "b1", [{"request_id": "q1", "cost": 1}])
+    body = post_batch(client, "b2", [{"request_id": "q1", "cost": 1}]).json()
+    assert body["committed"] is False
+    assert body["failed_index"] == 0
+    assert body["failure"]["reason"] == "request_id_exists"
+    # 快照为当前余额（9）
+    assert body["failure"]["buckets"][0]["balance"] == 9.0
+
+
+def test_batch_duplicate_request_id_within_batch(client):
+    put_policy(client, "global", 10, 0)
+    client.post("/decide", json={"request_id": "seed", "cost": 1})
+    body = post_batch(client, "b1", [
+        {"request_id": "dup", "cost": 1},
+        {"request_id": "dup", "cost": 1},
+    ]).json()
+    assert body["committed"] is False
+    assert body["failed_index"] == 1
+    assert body["failure"]["reason"] == "request_id_exists"
+    # 整批回滚，桶无变化
+    assert client.get("/buckets").json()[0]["balance"] == 9.0
+
+
+def test_batch_committed_items_replay_and_revoke_via_single_api(client):
+    put_policy(client, "global", 10, 0)
+    post_batch(client, "b1", [
+        {"request_id": "q1", "cost": 4},
+        {"request_id": "q2", "cost": 3},
+    ])
+    # /decide 同载荷重放批次中的单笔裁决：replayed=true，不重复扣减
+    replay = client.post("/decide", json={"request_id": "q1", "cost": 4}).json()
+    assert replay["allowed"] is True and replay["replayed"] is True
+    assert client.get("/buckets").json()[0]["balance"] == 3.0
+    # /revoke 撤销批次中的单笔裁决，只补回该笔
+    r = client.post("/decide/q2/revoke")
+    assert r.status_code == 200
+    assert r.json()["revoked"] is True
+    assert client.get("/buckets").json()[0]["balance"] == 6.0
+    # 重复撤销幂等
+    assert client.post("/decide/q2/revoke").json()["revoked"] is True
+
+
+def test_batch_low_balance_events_only_on_commit(client):
+    put_policy(client, "global", 10, 0, threshold=5)
+    # 10 -> 8（未越线）-> 3（越过阈值 5）：仅第二项产事件
+    body = post_batch(client, "b1", [
+        {"request_id": "q1", "cost": 2},
+        {"request_id": "q2", "cost": 5},
+    ]).json()
+    assert body["committed"] is True
+    events = client.get("/events").json()
+    assert [(e["request_id"], e["balance_before"], e["balance_after"])
+            for e in events] == [("q2", 8.0, 3.0)]
+    assert events[0]["threshold"] == 5.0
+
+    # 失败批次：模拟中即便越过阈值也不写事件
+    failed = post_batch(client, "b2", [
+        {"request_id": "q3", "cost": 1},
+        {"request_id": "q4", "cost": 5},  # 余额 2，不足
+    ]).json()
+    assert failed["committed"] is False
+    assert len(client.get("/events").json()) == 1
+
+
+def test_batch_multilevel_events_one_per_crossing_bucket(client):
+    put_policy(client, "global", 10, 0, threshold=5)
+    put_policy(client, "tenant", 8, 0, tenant="t", threshold=3)
+    body = post_batch(client, "b1", [
+        {"request_id": "q1", "tenant_id": "t", "cost": 6},
+    ]).json()
+    assert body["committed"] is True
+    # global 10->4、tenant 8->2，两层都越线，各一条
+    events = client.get("/events").json()
+    assert sorted((e["scope"], e["request_id"]) for e in events) == [
+        ("global", "q1"), ("tenant", "q1"),
+    ]
+
+
+def test_batch_applies_due_policy_changes_at_single_instant(client):
+    # 旧全局桶 100 速率 0，打掉 80（余 20）后登记 1s 后切到容量 50；
+    # 到期后的批次在同一事务先应用切换（20/100*50=10）再演算两项 4+6
+    put_policy(client, "global", 100, 0)
+    client.post("/decide", json={"request_id": "pre", "cost": 80})
+    post_change(client, "cg", "global", 50, 0, effective_in=1)
+    import time
+    time.sleep(1.2)
+    body = post_batch(client, "b1", [
+        {"request_id": "q1", "cost": 4},
+        {"request_id": "q2", "cost": 6},
+    ]).json()
+    assert body["committed"] is True
+    assert body["results"][0]["buckets"][0]["capacity"] == 50.0
+    assert body["results"][0]["buckets"][0]["balance"] == 6.0
+    assert body["results"][1]["buckets"][0]["balance"] == 0.0
+    assert client.get("/policy-changes/cg").json()["status"] == "applied"
+    assert client.get("/buckets").json()[0]["capacity"] == 50.0
+
+
+def test_batch_failed_leaves_due_change_pending(client):
+    # 到期切换虽在批事务内被惰性应用，但整批失败回滚后切换恢复 pending，
+    # 桶与策略也保持旧状态（业务数据不变）
+    put_policy(client, "global", 5, 0)
+    # 先创建桶（5 -> 4），便于回滚后校验桶行未被切换改写
+    client.post("/decide", json={"request_id": "seed", "cost": 1})
+    post_change(client, "cg", "global", 50, 0, effective_in=1)
+    import time
+    time.sleep(1.2)
+    # cost=99 超过新容量 50：切换后仍必然不足；失败回滚后切换恢复 pending
+    body = post_batch(client, "b1", [{"request_id": "q1", "cost": 99}]).json()
+    assert body["committed"] is False
+    assert body["failure"]["reason"] == "insufficient_balance"
+    assert client.get("/policy-changes/cg").json()["status"] == "pending"
+    bucket = client.get("/buckets").json()[0]
+    assert bucket["capacity"] == 5.0
+    assert bucket["balance"] == 4.0
+    # 批次失败结果仍已存档
+    replay = post_batch(client, "b1", [{"request_id": "q1", "cost": 99}]).json()
+    assert replay["replayed"] is True and replay["committed"] is False
+
+
+def test_batch_validation_errors(client):
+    put_policy(client, "global", 1, 0)
+    # 空数组 / 超过 50 项 -> 422
+    assert post_batch(client, "b", []).status_code == 422
+    r = post_batch(client, "b", [
+        {"request_id": f"x{i}", "cost": 1} for i in range(51)
+    ])
+    assert r.status_code == 422
+    # batch_id / request_id 为空 -> 422
+    assert post_batch(client, "", [{"request_id": "q", "cost": 1}]).status_code == 422
+    assert post_batch(client, "b", [{"request_id": "", "cost": 1}]).status_code == 422
+    # cost 非正 -> 422
+    assert post_batch(client, "b", [{"request_id": "q", "cost": 0}]).status_code == 422
+    # route 不带 tenant -> 422
+    r = post_batch(client, "b", [
+        {"request_id": "q", "route_id": "r", "cost": 1}
+    ])
+    assert r.status_code == 422
+
+
+def test_batch_no_matching_policy_returns_404(client):
+    # 无任何策略：不保存批次档案（与单笔裁决一致的用法错误）
+    r = post_batch(client, "b1", [{"request_id": "q1", "cost": 1}])
+    assert r.status_code == 404
+    # 同 batch_id 随后可正常使用（先前未存档）
+    put_policy(client, "global", 1, 0)
+    assert post_batch(client, "b1", [{"request_id": "q1", "cost": 1}]).status_code == 200
+
+
+def test_batch_remains_anonymous(client):
+    # 无签名头即可访问（404 表示已穿过认证层到达业务）
+    r = client.post("/decide-batches", json={
+        "batch_id": "b", "requests": [{"request_id": "q", "cost": 1}]})
+    assert r.status_code == 404
+
+
+def test_concurrent_batches_never_overspend(client):
+    capacity = 50
+    put_policy(client, "global", capacity, 0)
+
+    # 20 个线程各提交一个含 5 笔的批次；任一批失败都不得扣减，
+    # 全部成功批次的总扣减数恰好为 capacity
+    committed_items: list[int] = []
+    lock = threading.Lock()
+
+    def worker(idx):
+        body = post_batch(client, f"batch-{idx}", [
+            {"request_id": f"c-{idx}-{i}", "cost": 1} for i in range(5)
+        ]).json()
+        with lock:
+            if body["committed"]:
+                committed_items.append(len(body["results"]))
+
+    threads = [threading.Thread(target=worker, args=(j,)) for j in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sum(committed_items) == capacity
+    assert client.get("/buckets").json()[0]["balance"] == 0
+
+
 # ------------------------------------------------------------ 管理写接口 HMAC 防重放认证
 
 

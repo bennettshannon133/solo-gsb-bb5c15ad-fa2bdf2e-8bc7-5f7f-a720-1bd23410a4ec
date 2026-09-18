@@ -7,7 +7,7 @@
 管理写接口（PUT /policies、POST /policies/rollback、POST /policy-changes、
 DELETE /policy-changes/{change_id}）需要 HMAC-SHA256 防重放签名
 （X-Key-Id/X-Timestamp/X-Nonce/X-Signature，见 app/auth.py）；
-所有 GET、POST /decide 裁决与撤销接口保持匿名可用。
+所有 GET、POST /decide、POST /decide-batches 裁决与撤销接口保持匿名可用。
 """
 
 from __future__ import annotations
@@ -23,6 +23,8 @@ from .auth import AdminPrincipal, require_admin, reserve_nonce
 from .database import connect, init_db, write_tx
 from .schemas import (
     BucketOut,
+    DecideBatchIn,
+    DecideBatchOut,
     DecideIn,
     DecisionOut,
     LowBalanceEventOut,
@@ -51,11 +53,14 @@ app = FastAPI(
         "策略可配置 low_balance_threshold，余额越线时产生 low_balance 事件；"
         "支持提交未来生效的策略定时切换，由裁决在同一事务内惰性应用；"
         "策略变更追加不可变版本记录，支持历史查询与同事务回滚。"
+        "POST /decide-batches 在一个 BEGIN IMMEDIATE 事务内整批裁决 1～50 个请求："
+        "同一时刻应用命中的到期切换，按数组顺序演算共享桶，全部获准才落库，"
+        "批次按 batch_id 幂等存档。"
         "管理写接口（策略新增/更新、回滚、定时变更创建/取消）需要"
         " HMAC-SHA256 防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature）；"
-        "GET、裁决与撤销接口无需认证。"
+        "GET、裁决（含批量）与撤销接口无需认证。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -301,6 +306,43 @@ def decide(body: DecideIn, conn: sqlite3.Connection = Depends(get_conn)) -> dict
             cost=body.cost,
         )
         return result
+
+
+@app.post(
+    "/decide-batches",
+    response_model=DecideBatchOut,
+    tags=["裁决"],
+    responses={
+        404: {"description": "批次中某条目没有命中任何已配置的配额策略"},
+        409: {"description": "batch_id 已存在但完整载荷不一致"},
+    },
+)
+def decide_batches(
+    body: DecideBatchIn, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict:
+    """在一个 BEGIN IMMEDIATE 事务内对 1～50 个请求做整批裁决。
+
+    事务内先以同一时刻应用所有条目命中且到期的策略切换，再按数组顺序
+    演算共享的多级桶（前项扣减后的余额供后项使用）。仅全部获准时才写入
+    桶余额、普通裁决（decisions）与低余额事件；任一项不足或 request_id
+    已存在时这些业务数据一律不变，返回 committed=false、failed_index 和
+    该项当时的桶状态。无论成败批次结果都按 batch_id 存档；同键异载荷 409。
+    成功批次中的单笔裁决可经 POST /decide 重放、经 /revoke 撤销。
+    """
+    items = [item.model_dump() for item in body.requests]
+    try:
+        with write_tx(conn):
+            return quota.decide_batch(conn, batch_id=body.batch_id, items=items)
+    except quota.BatchRejected as rej:
+        # 业务事务已随异常整体回滚（桶/裁决/事件均未改变）；批次档案在
+        # 独立事务中保存，保证「无论成败均保存批次结果」
+        with write_tx(conn):
+            return quota.record_failed_batch(
+                conn,
+                batch_id=body.batch_id,
+                items=items,
+                failure=rej.failure,
+            )
 
 
 @app.post(

@@ -54,6 +54,21 @@ CREATE TABLE IF NOT EXISTS decisions (
     revoked_at        TEXT
 ) STRICT;
 
+-- 批量裁决结果按 batch_id 幂等存档（无论整批提交还是失败都保存）。
+-- committed=1：全部条目获准，单笔裁决同时写入 decisions；
+-- committed=0：failed_index 处条目不足或 request_id 已存在，桶余额/普通裁决/
+-- 低余额事件均未改变（业务事务已整体回滚），result_json 保存失败时该条目桶状态。
+-- batch_id 与完整载荷（payload_hash）一一对应：同键异载荷由业务层返回 409。
+CREATE TABLE IF NOT EXISTS decide_batches (
+    batch_id     TEXT PRIMARY KEY,
+    payload_hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    committed    INTEGER NOT NULL CHECK (committed IN (0, 1)),
+    failed_index INTEGER,
+    result_json  TEXT NOT NULL,
+    decided_at   TEXT NOT NULL
+) STRICT;
+
 -- 低余额事件：获准裁决令某桶从阈值之上降至不高于阈值时，
 -- 与扣减在同一事务内写入；id 自增，作为 /events 分页的稳定游标
 CREATE TABLE IF NOT EXISTS low_balance_events (

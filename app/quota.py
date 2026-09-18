@@ -963,6 +963,404 @@ def decide(
     return result, False
 
 
+# ------------------------------------------------------------ 批量裁决
+
+
+class BatchRejected(Exception):
+    """批量演算在某条目处整批失败（不足或 request_id 已存在）。
+
+    不是 4xx HTTP 错误：调用方回滚业务事务后，仍需把批次失败结果落档。
+    """
+
+    def __init__(self, index: int, reason: str, failure: dict[str, Any]):
+        super().__init__(f"batch failed at index={index}: {reason}")
+        self.index = index
+        self.reason = reason
+        self.failure = failure
+
+
+def _load_policy_levels_batch(
+    conn: sqlite3.Connection,
+    tenant_id: Optional[str],
+    route_id: Optional[str],
+) -> list[tuple[str, str, str, sqlite3.Row]]:
+    """解析一次裁决命中的已配置策略层（全局 -> 租户 -> 路由），缺省层不限制。"""
+    levels: list[tuple[str, str, str, sqlite3.Row]] = []
+    g = conn.execute(
+        "SELECT capacity, refill_rate, low_balance_threshold FROM policies "
+        "WHERE scope='global' AND tenant_id='' AND route_id=''"
+    ).fetchone()
+    if g is not None:
+        levels.append(("global", EMPTY, EMPTY, g))
+    if tenant_id:
+        t = conn.execute(
+            "SELECT capacity, refill_rate, low_balance_threshold FROM policies "
+            "WHERE scope='tenant' AND tenant_id=? AND route_id=''",
+            (tenant_id,),
+        ).fetchone()
+        if t is not None:
+            levels.append(("tenant", tenant_id, EMPTY, t))
+        if route_id:
+            r = conn.execute(
+                "SELECT capacity, refill_rate, low_balance_threshold FROM policies "
+                "WHERE scope='route' AND tenant_id=? AND route_id=?",
+                (tenant_id, route_id),
+            ).fetchone()
+            if r is not None:
+                levels.append(("route", tenant_id, route_id, r))
+    return levels
+
+
+def _batch_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """批次的规范载荷（不含 batch_id 也无所谓：hash 按行存储时 batch_id 已做主键，
+    这里把整批条目按数组顺序纳入摘要，任何字段或顺序变化都视为异载荷）。"""
+    return {"requests": items}
+
+
+def decide_batch(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: str,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """在一个写事务内完成整批裁决，返回可直接响应的结果字典。
+
+    事务内顺序：① 以同一时刻 now 应用所有条目命中、且已到期的定时策略切换
+    （仅一次）；② 按数组顺序在共享的多级桶上演算——前项模拟扣减后的余额
+    供后项使用；③ 仅当全部条目获准时，才一次性写入桶余额、普通裁决与
+    低余额事件，以及批次档案。
+
+    任一条目不足或 request_id 已存在（含批内重复）时抛出 BatchRejected，
+    调用方必须 ROLLBACK 当前事务，再调用 record_failed_batch 单独存档。
+
+    batch_id 幂等：已存在且完整载荷一致 -> 返回原结果（replayed=True）；
+    同键异载荷 -> 409。
+    """
+    for it in items:
+        if it["cost"] <= 0:
+            raise HTTPException(422, "cost 必须为正数")
+        if it.get("route_id") and not it.get("tenant_id"):
+            raise HTTPException(422, "提供 route_id 时必须同时提供 tenant_id")
+
+    canonical = _batch_payload(
+        [
+            {
+                "request_id": it["request_id"],
+                "tenant_id": it.get("tenant_id") or None,
+                "route_id": it.get("route_id") or None,
+                "cost": float(it["cost"]),
+            }
+            for it in items
+        ]
+    )
+    digest = payload_hash(canonical)
+    payload_json = json.dumps(canonical, ensure_ascii=False)
+
+    existing = conn.execute(
+        "SELECT payload_hash, result_json FROM decide_batches WHERE batch_id=?",
+        (batch_id,),
+    ).fetchone()
+    if existing is not None:
+        if existing["payload_hash"] != digest:
+            raise HTTPException(
+                409,
+                f"batch_id={batch_id!r} 已存在但批次载荷不一致，拒绝重放",
+            )
+        result = json.loads(existing["result_json"])
+        result["replayed"] = True
+        return result
+
+    now = now_utc()
+    now_iso = iso(now)
+
+    # 1) 同一时刻、同一事务内，先应用所有条目命中且到期的定时切换（并集去重）
+    hit_keys: list[tuple[str, str, str]] = []
+    for it in items:
+        for key in _hit_keys(it.get("tenant_id"), it.get("route_id")):
+            if key not in hit_keys:
+                hit_keys.append(key)
+    _apply_due_changes(conn, hit_keys, now)
+
+    # 共享桶状态缓存：同一桶被多个条目命中时，余额沿数组顺序传递
+    states: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def state_for(
+        scope: str, tenant: str, route: str, pol: sqlite3.Row
+    ) -> dict[str, Any]:
+        key = (scope, tenant, route)
+        st = states.get(key)
+        if st is not None:
+            return st
+        row = conn.execute(
+            "SELECT balance, updated_at FROM buckets "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            (scope, tenant, route),
+        ).fetchone()
+        if row is None:
+            # 桶尚未惰性创建：以满额参与演算，实际 INSERT 推迟到整批提交
+            balance = float(pol["capacity"])
+        else:
+            # 到期切换可能刚改写过该桶的余额与时间锚点；整批共用同一 now，
+            # 时间补充只在首次载入时计算一次
+            balance = _refill(
+                row["balance"], row["updated_at"],
+                pol["capacity"], pol["refill_rate"], now,
+            )
+        st = {
+            "scope": scope, "tenant": tenant, "route": route,
+            "capacity": float(pol["capacity"]),
+            "refill_rate": float(pol["refill_rate"]),
+            "low_balance_threshold": pol["low_balance_threshold"],
+            "balance": balance,
+            # 桶是否为本次演算中新引入（提交时才 INSERT）：失败回滚后
+            # 不应凭空多出余额为满额的桶行
+            "new_bucket": row is None,
+        }
+        states[key] = st
+        return st
+
+    seen_request_ids: set[str] = set()
+    item_results: list[dict[str, Any]] = []
+    # 每项命中桶的 (state, 扣减前, 扣减后)，低余额事件据此判定：
+    # 同一桶被多个条目命中时，各次越线必须按演算顺序逐个识别
+    item_deductions: list[list[tuple[dict[str, Any], float, float]]] = []
+
+    # 2) 按数组顺序演算：仅在全部获准后才真正落库
+    for idx, it in enumerate(items):
+        request_id = it["request_id"]
+        tenant_id = it.get("tenant_id")
+        route_id = it.get("route_id")
+        cost = float(it["cost"])
+
+        levels = _load_policy_levels_batch(conn, tenant_id, route_id)
+        if not levels:
+            raise HTTPException(404, "没有任何命中的配额策略（请先配置至少一层策略）")
+        item_states = [state_for(scope, tenant, route, pol)
+                       for scope, tenant, route, pol in levels]
+
+        # request_id 冲突（批内重复，或普通裁决/先前批次已存档）先于不足判定
+        if request_id in seen_request_ids:
+            raise BatchRejected(idx, "request_id_exists", _batch_failure(
+                idx, request_id, cost, tenant_id, route_id, item_states,
+                "request_id_exists"))
+        dup = conn.execute(
+            "SELECT 1 FROM decisions WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if dup is not None:
+            raise BatchRejected(idx, "request_id_exists", _batch_failure(
+                idx, request_id, cost, tenant_id, route_id, item_states,
+                "request_id_exists"))
+        seen_request_ids.add(request_id)
+
+        if not all(s["balance"] + 1e-12 >= cost for s in item_states):
+            raise BatchRejected(idx, "insufficient_balance", _batch_failure(
+                idx, request_id, cost, tenant_id, route_id, item_states,
+                "insufficient_balance"))
+
+        # 模拟扣减：只改共享缓存中的余额，循环结束且整批获准时统一持久化
+        deductions: list[tuple[dict[str, Any], float, float]] = []
+        for s in item_states:
+            before = s["balance"]
+            after = before - cost
+            s["balance"] = after
+            deductions.append((s, before, after))
+        item_deductions.append(deductions)
+
+        item_results.append(
+            {
+                "index": idx,
+                "request_id": request_id,
+                "allowed": True,
+                "cost": cost,
+                "tenant_id": tenant_id or None,
+                "route_id": route_id or None,
+                "decided_at": now_iso,
+                "buckets": [
+                    _bucket_out(
+                        s["scope"], s["tenant"], s["route"],
+                        s["capacity"], s["refill_rate"], s["balance"],
+                    )
+                    for s in item_states
+                ],
+            }
+        )
+
+    # 3) 全部获准：同一事务内写入桶余额、低余额事件、单笔裁决与批次档案。
+    #    低余额事件按演算顺序依据每项扣减前后的余额判定，request_id 归属
+    #    对应条目；同一批次中多个条目或多个桶越线各写一条。
+    for r, deductions in zip(item_results, item_deductions):
+        for s, before, after in deductions:
+            _maybe_emit_low_balance(
+                conn, s, before=before, after=after,
+                request_id=r["request_id"], now=now,
+            )
+    for s in states.values():
+        if s["new_bucket"]:
+            conn.execute(
+                "INSERT INTO buckets (scope, tenant_id, route_id, balance, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (s["scope"], s["tenant"], s["route"], s["balance"], now_iso),
+            )
+        else:
+            conn.execute(
+                "UPDATE buckets SET balance=?, updated_at=? "
+                "WHERE scope=? AND tenant_id=? AND route_id=?",
+                (s["balance"], now_iso, s["scope"], s["tenant"], s["route"]),
+            )
+
+    for r in item_results:
+        payload = {
+            "tenant_id": r["tenant_id"],
+            "route_id": r["route_id"],
+            "cost": r["cost"],
+        }
+        decision = {
+            "request_id": r["request_id"],
+            "allowed": True,
+            "cost": r["cost"],
+            "tenant_id": r["tenant_id"],
+            "route_id": r["route_id"],
+            "decided_at": now_iso,
+            "retry_at": None,
+            "retry_after_seconds": None,
+            "retry_possible": True,
+            "replayed": False,
+            "revoked": False,
+            "buckets": r["buckets"],
+        }
+        conn.execute(
+            """
+            INSERT INTO decisions
+                (request_id, payload_hash, payload_json, allowed, cost, decided_at,
+                 retry_at, retry_after_secs, result_json, revoked, revoked_at)
+            VALUES (?, ?, ?, 1, ?, ?, NULL, NULL, ?, 0, NULL)
+            """,
+            (
+                r["request_id"], payload_hash(payload),
+                json.dumps(payload, ensure_ascii=False), r["cost"], now_iso,
+                json.dumps(decision, ensure_ascii=False),
+            ),
+        )
+
+    result = {
+        "batch_id": batch_id,
+        "committed": True,
+        "replayed": False,
+        "decided_at": now_iso,
+        "results": item_results,
+        "failed_index": None,
+        "failure": None,
+    }
+    conn.execute(
+        """
+        INSERT INTO decide_batches
+            (batch_id, payload_hash, payload_json, committed, failed_index,
+             result_json, decided_at)
+        VALUES (?, ?, ?, 1, NULL, ?, ?)
+        """,
+        (batch_id, digest, payload_json,
+         json.dumps(result, ensure_ascii=False), now_iso),
+    )
+    return result
+
+
+def _batch_failure(
+    index: int,
+    request_id: str,
+    cost: float,
+    tenant_id: Optional[str],
+    route_id: Optional[str],
+    item_states: list[dict[str, Any]],
+    reason: str,
+) -> dict[str, Any]:
+    """构造失败条目快照（前序条目模拟扣减后的桶余额，尚未持久化）。"""
+    return {
+        "index": index,
+        "request_id": request_id,
+        "reason": reason,
+        "cost": float(cost),
+        "tenant_id": tenant_id or None,
+        "route_id": route_id or None,
+        "buckets": [
+            _bucket_out(
+                s["scope"], s["tenant"], s["route"],
+                s["capacity"], s["refill_rate"], s["balance"],
+            )
+            for s in item_states
+        ],
+    }
+
+
+def record_failed_batch(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: str,
+    items: list[dict[str, Any]],
+    failure: dict[str, Any],
+) -> dict[str, Any]:
+    """业务事务回滚后，在独立事务中保存失败批次的档案（无论成败均保存）。
+
+    返回可直接响应的结果。若并发下该 batch_id 已被另一事务存档：载荷一致
+    则重放原结果，异载荷则抛 409（与 decide_batch 内的幂等判定保持一致）。
+    """
+    canonical = _batch_payload(
+        [
+            {
+                "request_id": it["request_id"],
+                "tenant_id": it.get("tenant_id") or None,
+                "route_id": it.get("route_id") or None,
+                "cost": float(it["cost"]),
+            }
+            for it in items
+        ]
+    )
+    digest = payload_hash(canonical)
+    payload_json = json.dumps(canonical, ensure_ascii=False)
+    now_iso = iso(now_utc())
+    idx = failure["index"]
+    result = {
+        "batch_id": batch_id,
+        "committed": False,
+        "replayed": False,
+        "decided_at": now_iso,
+        "results": None,
+        "failed_index": idx,
+        "failure": {
+            "index": idx,
+            "request_id": failure["request_id"],
+            "reason": failure["reason"],
+            "cost": float(failure["cost"]),
+            "tenant_id": failure.get("tenant_id") or None,
+            "route_id": failure.get("route_id") or None,
+            "buckets": failure["buckets"],
+        },
+    }
+    try:
+        conn.execute(
+            """
+            INSERT INTO decide_batches
+                (batch_id, payload_hash, payload_json, committed, failed_index,
+                 result_json, decided_at)
+            VALUES (?, ?, ?, 0, ?, ?, ?)
+            """,
+            (batch_id, digest, payload_json, idx,
+             json.dumps(result, ensure_ascii=False), now_iso),
+        )
+    except sqlite3.IntegrityError:
+        row = conn.execute(
+            "SELECT payload_hash, result_json FROM decide_batches WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()
+        if row is not None and row["payload_hash"] != digest:
+            raise HTTPException(
+                409,
+                f"batch_id={batch_id!r} 已存在但批次载荷不一致，拒绝重放",
+            )
+        result = json.loads(row["result_json"])
+        result["replayed"] = True
+    return result
+
+
 # ---------------------------------------------------------------- 撤销
 
 

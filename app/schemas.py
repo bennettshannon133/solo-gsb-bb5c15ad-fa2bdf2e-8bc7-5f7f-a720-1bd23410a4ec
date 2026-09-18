@@ -124,6 +124,58 @@ class DecisionOut(BaseModel):
     buckets: list[BucketOut]
 
 
+class DecideBatchItemIn(BaseModel):
+    request_id: str = Field(..., min_length=1, description="单笔裁决幂等键，写入 decisions 表，可由 /decide 重放、/revoke 撤销")
+    tenant_id: Optional[str] = None
+    route_id: Optional[str] = Field(default=None, description="提供 route_id 时必须带 tenant_id")
+    cost: float = Field(..., gt=0, description="本次请求需要的令牌数，所有命中桶统一扣减")
+
+
+class DecideBatchIn(BaseModel):
+    batch_id: str = Field(..., min_length=1, description="批次幂等键：相同 batch_id + 相同完整载荷重放原结果；同键异载荷返回 409")
+    requests: list[DecideBatchItemIn] = Field(
+        ..., min_length=1, max_length=50, description="1～50 个裁决请求，按数组顺序演算共享桶"
+    )
+
+
+class BatchDecisionOut(BaseModel):
+    """成功批次中的单笔裁决（结构与 POST /decide 的结果一致，replayed 恒为 false）。"""
+    index: int
+    request_id: str
+    allowed: bool
+    cost: float
+    tenant_id: Optional[str]
+    route_id: Optional[str]
+    decided_at: str
+    buckets: list[BucketOut]
+
+
+class BatchFailureOut(BaseModel):
+    index: int = Field(..., description="数组中首个令整批失败的项下标（从 0 开始）")
+    request_id: str
+    reason: Literal["insufficient_balance", "request_id_exists"]
+    cost: float
+    tenant_id: Optional[str]
+    route_id: Optional[str]
+    buckets: list[BucketOut] = Field(
+        ..., description="失败那一刻该条目命中桶的状态（前序条目已模拟扣减，余额未持久化）"
+    )
+
+
+class DecideBatchOut(BaseModel):
+    batch_id: str
+    committed: bool
+    replayed: bool = False
+    decided_at: str
+    results: Optional[list[BatchDecisionOut]] = Field(
+        default=None, description="committed=true：按请求顺序的各单笔裁决"
+    )
+    failed_index: Optional[int] = None
+    failure: Optional[BatchFailureOut] = Field(
+        default=None, description="committed=false：首个失败条目及其当时桶状态"
+    )
+
+
 class RevokeOut(BaseModel):
     request_id: str
     allowed: bool
